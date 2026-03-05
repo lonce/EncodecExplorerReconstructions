@@ -1,8 +1,10 @@
-# Encodec Explorer Core 
+# Encodec Explorer 
 
-This is a notebook with some utilities for manipulating Encodec (24kHz) audio representations. 
+This project consists of a couple of  notebooks with some utilities for manipulating Encodec (24kHz) audio representations. 
 
 There are utilities for reading audio and .ecdc files, and for converting between audio, ecdc tokens, and latents. 
+
+There are notebooks for doing a Tokui-like "style transfer" using Encodec tokens, and there is a notebook for mocked streaming Encodec representations (reconstructing them a couple of frames at a time). 
 
 
 
