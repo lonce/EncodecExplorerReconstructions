@@ -1,0 +1,15 @@
+torch
+torchvision 
+torchaudio
+transformers
+numpy
+scipy
+matplotlib
+jupyter
+ipython
+notebook
+ipykernel
+soundfile
+datasets
+accelerate
+safetensors
