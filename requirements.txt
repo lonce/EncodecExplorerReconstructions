@@ -13,3 +13,4 @@ soundfile
 datasets
 accelerate
 safetensors
+rtpysynth[ui] @ git+https://github.com/lonce/RTPySynth@v0.1.4

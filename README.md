@@ -14,16 +14,16 @@ There are notebooks for doing a Tokui-like "style transfer" using Encodec tokens
 
 ```bash
 # 1. Create the environment
-conda create -n encodec_explore python=3.9 -y
+conda create -n rtokui python -y
 
 # 2. Activate it
-conda activate encodec_explore
+conda activate rtokui
 
 # 3. Install packages
 pip install -r requirements.txt
 
 # 4. Register Jupyter kernel
-python -m ipykernel install --user --name encodec_explore --display-name "Encodec Explorer"
+python -m ipykernel install --user --name encodec_explore --display-name "RTokui"
 
 ```
 

@@ -185,5 +185,268 @@ def tokens_TN_to_audio_1T(model, tokens_TN: torch.Tensor, device, audio_scales=N
     return audio_BCT[:, 0, :].detach().cpu().contiguous()
 
 
+########################################################################
+#########################################################################
+########################################################################
+import math
+import numpy as np
+from typing import Union
 
+
+from realtime_synth.generators.base import BaseGenerator
+from realtime_synth.utils import exp_map01
+from realtime_synth_ui import build_synth_ui
+
+# Assumes these already exist in your codebase:
+# - BaseGenerator
+# - normalize_latents
+# - target2poolindex
+
+
+class PoolMatcherGenerator(BaseGenerator):
+    param_labels = ["Pool start", "Pool end"]
+
+    def __init__(
+        self,
+        model,
+        target_latents_TD: torch.Tensor,
+        pool_latents_TD: torch.Tensor, # RAW pool latents [P,128]
+        *,
+        init_norm_params=None,
+        hop_size: int = 6,             # latent frames emitted per step
+        chunk_size: int = 24,          # latent frames decoded per step
+        window_size: int = 6,          # matching window length in latent frames
+        device: Union[str, torch.device] = "cpu",
+        wrap_target: bool = True,      # default: loop target forever
+        lookup_qkd = None,             # stored for future use; not needed yet in this latent-only version
+    ):
+        super().__init__(init_norm_params or [0.0, 1.0])
+
+        # --- basic checks ---
+        if target_latents_TD.ndim != 2 or target_latents_TD.shape[1] != 128:
+            raise ValueError(f"target_latents_TD must be [T,128], got {tuple(target_latents_TD.shape)}")
+        if pool_latents_TD.ndim != 2 or pool_latents_TD.shape[1] != 128:
+            raise ValueError(f"pool_latents_TD must be [P,128], got {tuple(pool_latents_TD.shape)}")
+
+        if hop_size <= 0 or chunk_size <= 0 or window_size <= 0:
+            raise ValueError("hop_size, chunk_size, and window_size must be positive")
+        if chunk_size < hop_size:
+            raise ValueError("chunk_size must be >= hop_size")
+        if hop_size % window_size != 0:
+            raise ValueError("hop_size must be an integer multiple of window_size")
+
+        self.model = model
+        self.lookup_qkd = lookup_qkd
+        self.device = torch.device(device)
+        self.model.eval()
+
+        # store target + pool
+        self.target_latents_TD = target_latents_TD.detach().float().to(self.device)
+        self.pool_latents_raw_TD = pool_latents_TD.detach().float().to(self.device)
+        self.pool_latents_norm_TD = normalize_latents(self.pool_latents_raw_TD)
+
+        self.T_target = self.target_latents_TD.shape[0]
+        self.T_pool = self.pool_latents_raw_TD.shape[0]
+
+        self.hop_size = int(hop_size)
+        self.chunk_size = int(chunk_size)
+        self.window_size = int(window_size)
+        self.pad = max(0, self.chunk_size - self.hop_size)
+        self.wrap_target = bool(wrap_target)
+
+        # infer model timing
+        cfg = getattr(self.model, "config", None)
+        sr = getattr(cfg, "sampling_rate", None)
+        fr = getattr(cfg, "frame_rate", None)
+        if sr is None or fr is None:
+            raise RuntimeError(
+                "Could not infer samples_per_frame. Expected model.config.sampling_rate and model.config.frame_rate."
+            )
+
+        spf = sr / fr
+        self.samples_per_frame = int(round(spf))
+        if not math.isclose(spf, self.samples_per_frame, rel_tol=0, abs_tol=1e-6):
+            raise RuntimeError(f"Non-integer samples_per_frame={spf} (sr={sr}, frame_rate={fr})")
+
+        self.sr_model = int(sr)
+        self.frame_rate_model = float(fr)
+        self.hop_samples = self.hop_size * self.samples_per_frame
+
+        # runtime state
+        self.target_cursor = 0
+        self.audio_fifo = np.zeros(0, dtype=np.float32)
+        self.chunk_latents_TD = None   # [chunk_size,128], initialized lazily
+
+        self.set_params(self.norm_params)
+
+    def set_params(self, norm_params):
+        super().set_params(norm_params)
+
+        # two sliders define normalized pool endpoints
+        a = float(np.clip(self.norm_params[0], 0.0, 1.0))
+        b = float(np.clip(self.norm_params[1], 0.0, 1.0))
+        lo = min(a, b)
+        hi = max(a, b)
+
+        # map to integer indices
+        p0 = int(round(lo * (self.T_pool - 1)))
+        p1 = int(round(hi * (self.T_pool - 1)))
+
+        # enforce enough room for at least one usable segment
+        min_len = max(self.window_size, self.hop_size)
+        if (p1 - p0 + 1) < min_len:
+            p1 = min(self.T_pool - 1, p0 + min_len - 1)
+            p0 = max(0, p1 - min_len + 1)
+
+        self.pool_start = int(p0)
+        self.pool_end = int(p1)
+
+    def formatted_readouts(self):
+        return [
+            f"{self.param_labels[0]}: {self.pool_start:6d}",
+            f"{self.param_labels[1]}: {self.pool_end:6d}",
+        ]
+
+    def reset(self):
+        self.target_cursor = 0
+        self.audio_fifo = np.zeros(0, dtype=np.float32)
+        self.chunk_latents_TD = None
+
+    def _current_pool_views(self):
+        """
+        Returns:
+            pool_norm_sel: [Psel,128] normalized, for matching
+            pool_raw_sel:  [Psel,128] raw, for playback
+        """
+        sl = slice(self.pool_start, self.pool_end + 1)
+        return self.pool_latents_norm_TD[sl], self.pool_latents_raw_TD[sl]
+
+    def _next_target_hop(self) -> torch.Tensor:
+        """
+        Returns next target hop: [hop_size,128]
+        Wraps around if wrap_target=True.
+        """
+        if self.wrap_target:
+            out = []
+            need = self.hop_size
+            while need > 0:
+                remain = self.T_target - self.target_cursor
+                take = min(need, remain)
+                out.append(self.target_latents_TD[self.target_cursor:self.target_cursor + take])
+                self.target_cursor = (self.target_cursor + take) % self.T_target
+                need -= take
+            return torch.cat(out, dim=0)
+
+        # non-wrapping mode
+        end = min(self.target_cursor + self.hop_size, self.T_target)
+        hop = self.target_latents_TD[self.target_cursor:end]
+        self.target_cursor = end
+
+        if hop.shape[0] < self.hop_size:
+            if hop.shape[0] > 0:
+                pad = hop[-1:].repeat(self.hop_size - hop.shape[0], 1)
+            else:
+                pad = torch.zeros(self.hop_size, 128, device=self.device, dtype=self.target_latents_TD.dtype)
+            hop = torch.cat([hop, pad], dim=0)
+
+        return hop
+
+    def transform_target_hop(self, hop_TD: torch.Tensor) -> torch.Tensor:
+        """
+        Hook for later creative processing (noise, interpolation, etc).
+        For now: identity.
+        """
+        return hop_TD
+
+    def _match_hop(self, target_hop_TD: torch.Tensor) -> torch.Tensor:
+        """
+        Match one target hop against the selected pool segment.
+        Returns matched RAW playback latents [hop_size,128].
+        """
+        pool_norm_sel, pool_raw_sel = self._current_pool_views()
+
+        idx_rel = target2poolindex(
+            target_hop_TD,
+            pool_norm_sel,
+            window=self.window_size,
+        )  # [hop_size], relative to selected pool slice
+
+        return pool_raw_sel[idx_rel]  # [hop_size,128]
+
+    @torch.no_grad()
+    def _prime_chunk(self):
+        """
+        Initialize chunk_latents_TD with:
+            [prefix repeated first matched frame] + [first matched hop]
+        so chunk length is exactly chunk_size.
+        """
+        hop = self.transform_target_hop(self._next_target_hop())
+        matched = self._match_hop(hop)  # [hop_size,128]
+
+        if self.pad > 0:
+            prefix = matched[:1].repeat(self.pad, 1)  # [pad,128]
+            self.chunk_latents_TD = torch.cat([prefix, matched], dim=0)
+        else:
+            self.chunk_latents_TD = matched
+
+        if self.chunk_latents_TD.shape != (self.chunk_size, 128):
+            raise RuntimeError(
+                f"Primed chunk shape {tuple(self.chunk_latents_TD.shape)} != ({self.chunk_size},128)"
+            )
+
+    @torch.no_grad()
+    def _produce_one_hop_audio(self) -> np.ndarray:
+        """
+        Produce exactly one hop's worth of audio samples.
+        Decode the full chunk, then emit only the last hop of decoded audio.
+        """
+        if self.chunk_latents_TD is None:
+            self._prime_chunk()
+        else:
+            hop = self.transform_target_hop(self._next_target_hop())
+            matched = self._match_hop(hop)  # [hop_size,128]
+
+            # shift chunk by hop and append new matched hop
+            self.chunk_latents_TD = torch.cat(
+                [self.chunk_latents_TD[self.hop_size:], matched],
+                dim=0
+            )
+
+        # decode whole chunk
+        z_BDT = self.chunk_latents_TD.unsqueeze(0).transpose(1, 2).contiguous()  # [1,128,chunk_size]
+        audio_BCT = self.model.decoder(z_BDT)                                     # [1,C,samples]
+        audio_1T = audio_BCT[:, 0, :].contiguous()                                # [1,samples]
+
+        if audio_1T.shape[1] < self.hop_samples:
+            raise RuntimeError(
+                f"Decoded chunk shorter than hop: got {audio_1T.shape[1]} samples, need {self.hop_samples}"
+            )
+
+        hop_audio = audio_1T[:, -self.hop_samples:].detach().cpu().numpy()[0]
+        return hop_audio.astype(np.float32, copy=False)
+
+    def generate(self, frames, sr):
+        """
+        RTPySynth callback.
+        Returns exactly `frames` float32 mono samples.
+        """
+        if sr != self.sr_model:
+            raise ValueError(f"Generator expects sr={self.sr_model}, got sr={sr}")
+
+        if frames <= 0:
+            return np.zeros(0, dtype=np.float32)
+
+        out = np.empty(frames, dtype=np.float32)
+        filled = 0
+
+        while filled < frames:
+            if self.audio_fifo.size == 0:
+                self.audio_fifo = self._produce_one_hop_audio()
+
+            take = min(frames - filled, self.audio_fifo.size)
+            out[filled:filled + take] = self.audio_fifo[:take]
+            self.audio_fifo = self.audio_fifo[take:]
+            filled += take
+
+        return out
     
