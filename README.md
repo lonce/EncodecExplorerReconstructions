@@ -32,6 +32,7 @@ python -m ipykernel install --user --name encodec_explore --display-name "RTokui
 1. **Activate environment:** `conda activate encodec_explore`
 2. **Start Jupyter:** `jupyter notebook` (or `jupyter lab`)
 3. **Select kernel:** In your notebook: Kernel → Change Kernel → "Encodec Explorer"
+4. **Run all cells** in **RT_Tokui.ipynb** (then explore with audio files & window size)
 
 ## Alternative: Conda Environment File
 
