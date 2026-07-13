@@ -23,15 +23,15 @@ conda activate rtokui
 pip install -r requirements.txt
 
 # 4. Register Jupyter kernel
-python -m ipykernel install --user --name encodec_explore --display-name "RTokui"
+python -m ipykernel install --user --name rtokui --display-name "RTokui"
 
 ```
 
 ## Usage
 
-1. **Activate environment:** `conda activate encodec_explore`
+1. **Activate environment:** `conda activate rtokui`
 2. **Start Jupyter:** `jupyter notebook` (or `jupyter lab`)
-3. **Select kernel:** In your notebook: Kernel → Change Kernel → "Encodec Explorer"
+3. **Select kernel:** In your notebook: Kernel → Change Kernel → "RTokui"
 4. **Run all cells** in **RT_Tokui.ipynb** (then explore with audio files & window size)
 
 ## Alternative: Conda Environment File
